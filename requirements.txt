@@ -1,1 +1,5 @@
-
+pandas
+numpy
+scipy
+matplotlib
+apache-airflow
