@@ -1,233 +1,315 @@
-import pandas as pd
-import numpy as np
+"""
+RQ1 - Baseline Profiling (DB-backed) + Drift Metrics + Figures (MERGED)
+
+Tables (Excel):
+- tables/RQ1_Table1.xlsx : Baseline descriptive statistics (numeric features)
+- tables/RQ1_Table2.xlsx : Baseline vs New batch comparison (numeric features)
+- tables/RQ1_Table3.xlsx : Drift metrics per feature (KS + PSI)
+
+Figures (PDF):
+- figures/RQ1_Fig1.pdf : Weekly_Sales distribution (baseline vs new batch)
+- figures/RQ1_Fig2.pdf : Top drifted features by PSI (baseline vs new batch)
+- figures/RQ1_Fig3.pdf : Mean PSI drift trend across batches (vs baseline)
+
+Data source:
+- PostgreSQL table: walmart_processed
+
+Baseline:
+- First N batches (default N=10)
+
+New batch:
+- Default: latest batch (MAX(Batch_ID))
+"""
+
+import os
+import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sqlalchemy import text
 
-NUMERIC_COLS_DEFAULT = ["Weekly_Sales", "Temperature", "Fuel_Price", "CPI", "Unemployment"]
-CATEGORICAL_COLS_DEFAULT = ["Store", "Holiday_Flag"]
+# Make `src/` discoverable when running directly:
+# python src/evaluation/rq1_baseline_profiling.py
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from data_ingestion.db_engine import get_engine  # noqa: E402
 
 
-def _missing_value_percent(df: pd.DataFrame) -> float:
-    # % of missing cells across the whole dataframe
-    total_cells = df.shape[0] * df.shape[1]
-    if total_cells == 0:
+# -----------------------------
+# Stats helpers
+# -----------------------------
+def ks_statistic(x_base: np.ndarray, x_new: np.ndarray) -> float:
+    """Two-sample KS statistic (no SciPy required)."""
+    x_base = np.sort(np.asarray(x_base, dtype=float))
+    x_new = np.sort(np.asarray(x_new, dtype=float))
+
+    if x_base.size == 0 or x_new.size == 0:
+        return float("nan")
+
+    data_all = np.sort(np.concatenate([x_base, x_new]))
+    cdf_base = np.searchsorted(x_base, data_all, side="right") / x_base.size
+    cdf_new = np.searchsorted(x_new, data_all, side="right") / x_new.size
+    return float(np.max(np.abs(cdf_base - cdf_new)))
+
+
+def psi(base: np.ndarray, new: np.ndarray, bins: int = 10) -> float:
+    """Population Stability Index using baseline quantile bins (robust)."""
+    base = np.asarray(base, dtype=float)
+    new = np.asarray(new, dtype=float)
+
+    base = base[~np.isnan(base)]
+    new = new[~np.isnan(new)]
+    if base.size == 0 or new.size == 0:
+        return float("nan")
+
+    edges = np.quantile(base, np.linspace(0, 1, bins + 1))
+    edges = np.unique(edges)
+
+    # If edges collapse (near-constant baseline), return 0 drift
+    if edges.size < 3:
         return 0.0
-    return float(df.isna().sum().sum() / total_cells * 100)
+
+    base_counts, _ = np.histogram(base, bins=edges)
+    new_counts, _ = np.histogram(new, bins=edges)
+
+    base_pct = base_counts / max(base_counts.sum(), 1)
+    new_pct = new_counts / max(new_counts.sum(), 1)
+
+    eps = 1e-10
+    base_pct = np.clip(base_pct, eps, None)
+    new_pct = np.clip(new_pct, eps, None)
+
+    return float(np.sum((new_pct - base_pct) * np.log(new_pct / base_pct)))
 
 
-def _duplicate_row_count(df: pd.DataFrame) -> int:
-    return int(df.duplicated().sum())
-
-
-def _incorrect_datatype_count(df: pd.DataFrame, expected_types: dict) -> int:
-    """
-    expected_types example:
-    {
-      "Date": "datetime64[ns]",
-      "Store": "int64",
-      ...
-    }
-    We count mismatches for columns present in df.
-    """
-    mismatches = 0
-    for col, exp_type in expected_types.items():
-        if col not in df.columns:
-            continue
-        actual = str(df[col].dtype)
-        if actual != exp_type:
-            mismatches += 1
-    return int(mismatches)
-
-
-def _outlier_percent_iqr(df: pd.DataFrame, numeric_cols: list) -> float:
-    """
-    Simple outlier percentage using IQR rule aggregated across numeric columns:
-    outlier if value < Q1 - 1.5*IQR or > Q3 + 1.5*IQR
-    We count outlier flags per numeric column and average.
-    """
-    if df.empty:
-        return 0.0
-
-    outlier_rates = []
-    for col in numeric_cols:
-        if col not in df.columns:
-            continue
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
-        if series.empty:
-            continue
-        q1 = series.quantile(0.25)
-        q3 = series.quantile(0.75)
-        iqr = q3 - q1
-        if iqr == 0:
-            outlier_rates.append(0.0)
-            continue
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        outlier_flags = (series < lower) | (series > upper)
-        outlier_rates.append(outlier_flags.mean() * 100)
-
-    if not outlier_rates:
-        return 0.0
-    return float(np.mean(outlier_rates))
-
-
-def _unique_category_count(df: pd.DataFrame, col: str) -> int:
-    if col not in df.columns:
-        return 0
-    return int(df[col].nunique(dropna=True))
-
-
+# -----------------------------
+# RQ1 outputs
+# -----------------------------
 def build_rq1_tables(
-    processed_csv_path: str = "data/sample/walmart_processed.csv",
     baseline_batches: int = 10,
     new_batch_id: int | None = None,
-    numeric_cols: list | None = None,
-    categorical_cols: list | None = None,
-    output_dir: str = "tables"
-):
+    output_dir: str = "tables",
+) -> tuple[int, int]:
     """
-    Generates:
-      - tables/RQ1_Table1.xlsx : Baseline vs New Batch Quality Metrics
-      - tables/RQ1_Table2.xlsx : Summary of Drift Types Detected (rule-based)
+    Generates RQ1_Table1/2/3 into output_dir.
+    Returns: (baseline_batches, resolved_new_batch_id)
     """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    numeric_cols = numeric_cols or NUMERIC_COLS_DEFAULT
-    categorical_cols = categorical_cols or CATEGORICAL_COLS_DEFAULT
+    engine = get_engine()
+    df = pd.read_sql(text("SELECT * FROM walmart_processed"), con=engine)
 
-    df = pd.read_csv(processed_csv_path)
-
-    # Safety checks
     if "Batch_ID" not in df.columns:
-        raise ValueError("Batch_ID not found. Run ingestion step to create walmart_processed.csv first.")
+        raise ValueError("Batch_ID not found in walmart_processed.")
 
-    # Convert Date if present (robust)
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Batch_ID"] = pd.to_numeric(df["Batch_ID"], errors="coerce")
+    df = df.dropna(subset=["Batch_ID"]).copy()
+    df["Batch_ID"] = df["Batch_ID"].astype(int)
 
-    # Baseline selection
-    baseline_df = df[df["Batch_ID"] <= baseline_batches].copy()
-
-    # Pick a "new batch" to compare:
-    # If user didn't provide, use the last batch (most recent week)
     if new_batch_id is None:
         new_batch_id = int(df["Batch_ID"].max())
-    new_batch_df = df[df["Batch_ID"] == new_batch_id].copy()
 
-    if baseline_df.empty:
-        raise ValueError("Baseline dataframe is empty. Increase baseline_batches or verify Batch_ID values.")
-    if new_batch_df.empty:
-        raise ValueError(f"New batch dataframe is empty for Batch_ID={new_batch_id}. Choose an existing batch.")
+    baseline_df = df[df["Batch_ID"] <= baseline_batches].copy()
+    new_df = df[df["Batch_ID"] == new_batch_id].copy()
 
-    # Expected dtype mapping (only those that exist will be checked)
-    expected_types = {
-        "Date": "datetime64[ns]",
-        "Store": "int64",
-        "Holiday_Flag": "int64",
-        "Weekly_Sales": "float64",
-        "Temperature": "float64",
-        "Fuel_Price": "float64",
-        "CPI": "float64",
-        "Unemployment": "float64",
-        "Batch_ID": "int64",
-    }
+    if baseline_df.empty or new_df.empty:
+        raise ValueError("Baseline or new batch is empty. Check Batch_ID logic.")
 
-    # Compute quality metrics: baseline vs new
-    baseline_missing = _missing_value_percent(baseline_df)
-    new_missing = _missing_value_percent(new_batch_df)
+    numeric_cols = baseline_df.select_dtypes(include=["number"]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c not in ["Batch_ID"]]
 
-    baseline_outlier = _outlier_percent_iqr(baseline_df, numeric_cols)
-    new_outlier = _outlier_percent_iqr(new_batch_df, numeric_cols)
+    # -------------------------
+    # Table1: baseline descriptive stats
+    # -------------------------
+    desc = baseline_df[numeric_cols].describe().T.reset_index().rename(columns={"index": "Feature"})
+    table1_path = Path(output_dir) / "RQ1_Table1.xlsx"
+    desc.to_excel(table1_path, index=False)
 
-    baseline_dupes = _duplicate_row_count(baseline_df)
-    new_dupes = _duplicate_row_count(new_batch_df)
+    # -------------------------
+    # Table2: baseline vs new batch comparison
+    # -------------------------
+    rows = []
+    for col in numeric_cols:
+        b = pd.to_numeric(baseline_df[col], errors="coerce").dropna()
+        n = pd.to_numeric(new_df[col], errors="coerce").dropna()
+        if len(b) == 0 or len(n) == 0:
+            continue
 
-    baseline_dtype_mismatch = _incorrect_datatype_count(baseline_df, expected_types)
-    new_dtype_mismatch = _incorrect_datatype_count(new_batch_df, expected_types)
+        rows.append(
+            {
+                "Feature": col,
+                "Baseline_Mean": float(b.mean()),
+                "NewBatch_Mean": float(n.mean()),
+                "Baseline_Std": float(b.std()),
+                "NewBatch_Std": float(n.std()),
+                "Mean_Diff": float(n.mean() - b.mean()),
+            }
+        )
+    comp_df = pd.DataFrame(rows)
+    table2_path = Path(output_dir) / "RQ1_Table2.xlsx"
+    comp_df.to_excel(table2_path, index=False)
 
-    baseline_unique_store = _unique_category_count(baseline_df, "Store")
-    new_unique_store = _unique_category_count(new_batch_df, "Store")
-
-    table1 = pd.DataFrame({
-        "Data Quality Metric": [
-            "Missing Value % (overall)",
-            "Outlier % (IQR rule, avg across numeric cols)",
-            "Incorrect Data Types (column dtype mismatches)",
-            "Duplicate Records (row duplicates)",
-            "Unique Categories (Store)"
-        ],
-        "Baseline Value": [
-            round(baseline_missing, 3),
-            round(baseline_outlier, 3),
-            baseline_dtype_mismatch,
-            baseline_dupes,
-            baseline_unique_store
-        ],
-        "New Batch Value": [
-            round(new_missing, 3),
-            round(new_outlier, 3),
-            new_dtype_mismatch,
-            new_dupes,
-            new_unique_store
-        ]
-    })
-
-    # ---- Rule-based drift summary for Table 1.2 ----
+    # -------------------------
+    # Table3: drift metrics per feature (KS + PSI)
+    # -------------------------
     drift_rows = []
+    for col in numeric_cols:
+        b = pd.to_numeric(baseline_df[col], errors="coerce").dropna().values
+        n = pd.to_numeric(new_df[col], errors="coerce").dropna().values
+        if len(b) == 0 or len(n) == 0:
+            continue
 
-    # Missing-value drift
-    if new_missing > baseline_missing * 1.5 and (new_missing - baseline_missing) > 0.1:
-        drift_rows.append(("Missing-value Drift", "Increase in nulls", "Multiple columns", "Cleaning fills nulls but does not monitor trend"))
-    else:
-        drift_rows.append(("Missing-value Drift", "Stable / small change", "Multiple columns", "No strong missingness drift signal"))
+        drift_rows.append(
+            {
+                "Feature": col,
+                "KS_Statistic": ks_statistic(b, n),
+                "PSI": psi(b, n, bins=10),
+            }
+        )
 
-    # Distribution drift proxy using outliers
-    if new_outlier > baseline_outlier * 1.5 and (new_outlier - baseline_outlier) > 0.1:
-        drift_rows.append(("Distribution / Anomaly Drift", "Outlier rate spike (IQR)", "Numeric features", "Outlier removal may hide drift rather than detect it"))
-    else:
-        drift_rows.append(("Distribution / Anomaly Drift", "Stable outlier rate", "Numeric features", "No strong anomaly drift signal"))
-
-    # Category drift: new stores appearing in new batch vs baseline
-    if new_unique_store > baseline_unique_store:
-        drift_rows.append(("Category Drift", "New category values appear", "Store", "Encoding masks frequency change without alerting"))
-    else:
-        drift_rows.append(("Category Drift", "No new categories", "Store", "No category expansion detected"))
-
-    # Schema/type drift proxy
-    if new_dtype_mismatch > 0:
-        drift_rows.append(("Schema / Type Drift", "Unexpected dtype mismatch", "Schema check", "Cleaning may coerce types silently without alerting"))
-    else:
-        drift_rows.append(("Schema / Type Drift", "No dtype mismatch", "Schema check", "No schema drift detected"))
-
-    table2 = pd.DataFrame(drift_rows, columns=[
-        "Drift Type",
-        "Description",
-        "Example Column",
-        "Why Traditional Cleaning Fails / Notes"
-    ])
-
-    # ---- Save outputs ----
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Strict naming (MANDATORY)
-    table1_path = out_dir / "RQ1_Table1.xlsx"
-    table2_path = out_dir / "RQ1_Table2.xlsx"
-
-    with pd.ExcelWriter(table1_path, engine="openpyxl") as writer:
-        table1.to_excel(writer, index=False, sheet_name="RQ1_Table1")
-
-    with pd.ExcelWriter(table2_path, engine="openpyxl") as writer:
-        table2.to_excel(writer, index=False, sheet_name="RQ1_Table2")
+    drift_df = pd.DataFrame(drift_rows).sort_values("PSI", ascending=False)
+    table3_path = Path(output_dir) / "RQ1_Table3.xlsx"
+    drift_df.to_excel(table3_path, index=False)
 
     print("RQ1 tables generated successfully:")
-    print(f"- {table1_path}")
-    print(f"- {table2_path}")
+    print(f"- {table1_path.as_posix()}")
+    print(f"- {table2_path.as_posix()}")
+    print(f"- {table3_path.as_posix()}")
     print(f"Baseline batches used: 1..{baseline_batches}")
     print(f"New batch compared: Batch_ID={new_batch_id}")
 
-    return table1, table2
+    return baseline_batches, int(new_batch_id)
+
+
+def generate_rq1_figures(
+    baseline_batches: int = 10,
+    new_batch_id: int | None = None,
+    output_dir: str = "figures",
+) -> tuple[int, int]:
+    """
+    Generates RQ1_Fig1/2/3 into output_dir.
+    Returns: (baseline_batches, resolved_new_batch_id)
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    engine = get_engine()
+    df = pd.read_sql(text("SELECT * FROM walmart_processed"), con=engine)
+
+    if "Batch_ID" not in df.columns:
+        raise ValueError("Batch_ID not found in walmart_processed.")
+
+    df["Batch_ID"] = pd.to_numeric(df["Batch_ID"], errors="coerce")
+    df = df.dropna(subset=["Batch_ID"]).copy()
+    df["Batch_ID"] = df["Batch_ID"].astype(int)
+
+    if new_batch_id is None:
+        new_batch_id = int(df["Batch_ID"].max())
+
+    baseline_df = df[df["Batch_ID"] <= baseline_batches].copy()
+    new_df = df[df["Batch_ID"] == new_batch_id].copy()
+
+    if baseline_df.empty or new_df.empty:
+        raise ValueError("Baseline or new batch is empty. Check Batch_ID logic.")
+
+    # -------------------------
+    # Fig1: Weekly_Sales distribution shift
+    # -------------------------
+    fig1_path = Path(output_dir) / "RQ1_Fig1.pdf"
+    plt.figure()
+    plt.hist(baseline_df["Weekly_Sales"], bins=40, alpha=0.6, label=f"Baseline (Batches 1..{baseline_batches})")
+    plt.hist(new_df["Weekly_Sales"], bins=40, alpha=0.6, label=f"New Batch ({new_batch_id})")
+    plt.xlabel("Weekly_Sales")
+    plt.ylabel("Frequency")
+    plt.title("RQ1_Fig1: Weekly_Sales Distribution (Baseline vs New Batch)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(fig1_path)
+    plt.close()
+
+    # -------------------------
+    # Fig2: Top features by PSI (baseline vs new)
+    # -------------------------
+    numeric_cols = baseline_df.select_dtypes(include=["number"]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c not in ["Batch_ID"]]
+
+    psi_rows = []
+    for col in numeric_cols:
+        b = pd.to_numeric(baseline_df[col], errors="coerce").dropna().values
+        n = pd.to_numeric(new_df[col], errors="coerce").dropna().values
+        if len(b) == 0 or len(n) == 0:
+            continue
+        psi_rows.append({"Feature": col, "PSI": psi(b, n, bins=10)})
+
+    psi_df = pd.DataFrame(psi_rows).sort_values("PSI", ascending=False)
+    top = psi_df.head(10)
+
+    fig2_path = Path(output_dir) / "RQ1_Fig2.pdf"
+    plt.figure(figsize=(9, 4))
+    plt.bar(top["Feature"], top["PSI"])
+    plt.xticks(rotation=45, ha="right")
+    plt.xlabel("Feature")
+    plt.ylabel("PSI")
+    plt.title("RQ1_Fig2: Top Drifted Features by PSI (Baseline vs New Batch)")
+    plt.tight_layout()
+    plt.savefig(fig2_path)
+    plt.close()
+
+    # -------------------------
+    # Fig3: Drift trend over batches (mean PSI vs baseline)
+    # -------------------------
+    baseline_ref = baseline_df.copy()
+    trend_rows = []
+
+    for b_id, g in df.groupby("Batch_ID"):
+        if int(b_id) <= baseline_batches:
+            continue
+
+        vals = []
+        for col in numeric_cols:
+            b = pd.to_numeric(baseline_ref[col], errors="coerce").dropna().values
+            n = pd.to_numeric(g[col], errors="coerce").dropna().values
+            if len(b) == 0 or len(n) == 0:
+                continue
+            vals.append(psi(b, n, bins=10))
+
+        mean_psi = float(np.mean(vals)) if vals else np.nan
+        trend_rows.append({"Batch_ID": int(b_id), "Mean_PSI": mean_psi})
+
+    trend_df = pd.DataFrame(trend_rows).sort_values("Batch_ID")
+
+    fig3_path = Path(output_dir) / "RQ1_Fig3.pdf"
+    plt.figure()
+    plt.plot(trend_df["Batch_ID"], trend_df["Mean_PSI"])
+    plt.xlabel("Batch_ID (Weekly)")
+    plt.ylabel("Mean PSI vs Baseline")
+    plt.title("RQ1_Fig3: Drift Trend Across Batches (Mean PSI)")
+    plt.tight_layout()
+    plt.savefig(fig3_path)
+    plt.close()
+
+    print("RQ1 figures generated successfully:")
+    print(f"- {fig1_path.as_posix()}")
+    print(f"- {fig2_path.as_posix()}")
+    print(f"- {fig3_path.as_posix()}")
+    print(f"Baseline batches used: 1..{baseline_batches}")
+    print(f"New batch compared: Batch_ID={new_batch_id}")
+
+    return baseline_batches, int(new_batch_id)
+
+
+def build_rq1_outputs(
+    baseline_batches: int = 10,
+    new_batch_id: int | None = None,
+    table_dir: str = "tables",
+    fig_dir: str = "figures",
+) -> None:
+    """
+    One-shot RQ1 runner: generates ALL RQ1 tables + figures.
+    """
+    _, resolved_new = build_rq1_tables(baseline_batches=baseline_batches, new_batch_id=new_batch_id, output_dir=table_dir)
+    generate_rq1_figures(baseline_batches=baseline_batches, new_batch_id=resolved_new, output_dir=fig_dir)
 
 
 if __name__ == "__main__":
-    build_rq1_tables()
-
+    build_rq1_outputs(baseline_batches=10, new_batch_id=None, table_dir="tables", fig_dir="figures")
